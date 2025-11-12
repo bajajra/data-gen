@@ -1,0 +1,11 @@
+[project]
+name = "data-gen"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.4.1",
+    "requests>=2.32.5",
+    "vllm>=0.11.0",
+]
