@@ -140,6 +140,7 @@ def upload_one_folder(api: HfApi, src: Path, repo_id: str, path_in_repo_base: st
         repo_type="dataset",
         path_in_repo=dest,
         commit_message=msg,
+        ignore_patterns=["**/*.json", "*.json"]
         # You can also use allow_patterns / ignore_patterns to filter, if needed.
     )
     # `upload_folder` returns a CommitInfo (commit hash/url, etc.)
