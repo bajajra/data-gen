@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
 """
-multi_gpu_gliner2_infer.py
+multi_gpu_gliner2_hf_dataset_infer.py
 
-High-throughput multi-GPU entity extraction with GLiNER2 using data-parallel sharding.
-Each process loads its own GLiNER2 model on its own device (GPU) and processes a shard
-of the input.
+Multi-GPU entity extraction with GLiNER2 over a Hugging Face dataset.
+One process per GPU (Accelerate), each processes a shard and writes its own JSONL part.
 
-Input:
-  - .jsonl: each line is a JSON object containing `text_field` (default: "text")
-  - .txt: each line is treated as raw text
+Examples:
+  # From Hub
+  accelerate launch --num_processes 4 multi_gpu_gliner2_hf_dataset_infer.py \
+    --dataset cnn_dailymail --config 3.0.0 --split test \
+    --text-field article \
+    --labels person,company,location \
+    --output out --batch-size 64 --bf16 --streaming
 
-Output:
-  - Writes one shard per rank: <output_dir>/part-00000.jsonl, part-00001.jsonl, ...
-  - Each output line is JSON with at minimum: {"id": ..., "text": ..., "entities": ...}
-
-Run (recommended):
-  pip install gliner2 accelerate torch
-  accelerate launch --num_processes 4 multi_gpu_gliner2_infer.py \
-      --input data.jsonl --output out \
-      --labels company,person,product,location --batch-size 64 --fp16
-
-Notes:
-  - The script tries to call extract_entities() in batch mode (list[str]) if supported;
-    otherwise it falls back to per-text calls.
-  - It attempts to pass `threshold` / `include_confidence` only if the installed
-    gliner2 version supports those parameters.
+  # From disk (saved via datasets.save_to_disk)
+  accelerate launch --num_processes 4 multi_gpu_gliner2_hf_dataset_infer.py \
+    --dataset /path/to/dataset_on_disk --split train \
+    --text-field text --id-field id \
+    --labels person,org,location \
+    --output out --batch-size 64 --fp16
 """
 
 from __future__ import annotations
@@ -36,14 +30,16 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import torch
 from accelerate import PartialState
 from gliner2 import GLiNER2
 
+import datasets  # pip install datasets
 
-LabelsType = Union[List[str], Dict[str, str]]  # list of labels OR {label: description}
+
+LabelsType = Union[List[str], Dict[str, str]]  # list OR {label: description}
 
 
 @dataclass
@@ -57,38 +53,33 @@ class Record:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="fastino/gliner2-base-v1", help="HF model id for GLiNER2")
-    p.add_argument("--input", required=True, help="Path to .jsonl or .txt input")
-    p.add_argument("--output", required=True, help="Output directory (will write one shard per rank)")
-    p.add_argument("--text-field", default="text", help="JSONL field containing the text")
-    p.add_argument("--id-field", default="id", help="JSONL field containing the id (fallback: line index)")
+
+    # Dataset inputs
+    p.add_argument("--dataset", required=True, help="HF dataset name (hub) OR path to load_from_disk dir")
+    p.add_argument("--config", default=None, help="HF dataset config name (if applicable)")
+    p.add_argument("--split", default="train", help="Dataset split (train/validation/test/...)")
+    p.add_argument("--streaming", action="store_true", help="Use streaming=True for load_dataset")
+    p.add_argument("--revision", default=None, help="Optional dataset revision (hub)")
+
+    p.add_argument("--text-field", default="text", help="Column containing the text")
+    p.add_argument("--id-field", default=None, help="Optional id column (fallback: running index)")
+
+    p.add_argument("--output", required=True, help="Output directory; writes one shard per rank")
     p.add_argument("--labels", default="", help="Comma-separated entity labels (e.g. person,company,location)")
-    p.add_argument(
-        "--labels-json",
-        default="",
-        help="Path to JSON file containing either a list of labels OR a {label: description} mapping",
-    )
+    p.add_argument("--labels-json", default="", help="JSON file with list of labels or {label: description}")
     p.add_argument("--threshold", type=float, default=0.5, help="Confidence threshold if supported by API")
     p.add_argument("--include-confidence", action="store_true", help="Include confidence if supported by API")
-    p.add_argument("--batch-size", type=int, default=64, help="Max records per forward")
-    p.add_argument(
-        "--max-chars-per-batch",
-        type=int,
-        default=20000,
-        help="Soft cap to avoid pathological long-text batches (sum of char lengths).",
-    )
-    p.add_argument(
-        "--prefetch-batches",
-        type=int,
-        default=8,
-        help="How many batches to prefetch in a background thread (per rank).",
-    )
+
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--max-chars-per-batch", type=int, default=20000)
+    p.add_argument("--prefetch-batches", type=int, default=8)
 
     # GPU perf knobs
-    p.add_argument("--fp16", action="store_true", help="Use fp16 autocast on CUDA")
-    p.add_argument("--bf16", action="store_true", help="Use bf16 autocast on CUDA (Ampere+)")
-    p.add_argument("--compile", action="store_true", help="Try torch.compile() where possible")
+    p.add_argument("--fp16", action="store_true")
+    p.add_argument("--bf16", action="store_true")
+    p.add_argument("--compile", action="store_true")
 
-    p.add_argument("--flush-every", type=int, default=200, help="Flush output every N records")
+    p.add_argument("--flush-every", type=int, default=200)
     return p.parse_args()
 
 
@@ -97,7 +88,6 @@ def load_labels(args: argparse.Namespace) -> LabelsType:
         with open(args.labels_json, "r", encoding="utf-8") as f:
             obj = json.load(f)
         if isinstance(obj, dict):
-            # {label: description}
             return {str(k): str(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [str(x) for x in obj]
@@ -108,39 +98,52 @@ def load_labels(args: argparse.Namespace) -> LabelsType:
     return [x.strip() for x in args.labels.split(",") if x.strip()]
 
 
-def iter_records(
-    path: str,
+def load_hf_dataset(args: argparse.Namespace):
+    """
+    Supports:
+      - datasets.load_from_disk(path) (Arrow dataset on local disk)
+      - datasets.load_dataset(name, config, split=..., streaming=...)
+    Returns a Dataset or IterableDataset.
+    """
+    if os.path.isdir(args.dataset):
+        obj = datasets.load_from_disk(args.dataset)
+        if isinstance(obj, datasets.DatasetDict):
+            if args.split not in obj:
+                raise ValueError(f"Split '{args.split}' not found in dataset dict. Available: {list(obj.keys())}")
+            return obj[args.split]
+        return obj
+
+    # Hub / scripted dataset
+    return datasets.load_dataset(
+        args.dataset,
+        args.config,
+        split=args.split,
+        streaming=args.streaming,
+        revision=args.revision,
+    )
+
+
+def shard_dataset(ds, rank: int, world_size: int, streaming: bool):
+    # For map-style datasets, contiguous sharding is cache-friendly.
+    if not streaming:
+        return ds.shard(num_shards=world_size, index=rank, contiguous=True)
+    # IterableDataset also supports shard() in HF datasets.
+    return ds.shard(num_shards=world_size, index=rank)
+
+
+def iter_records_from_dataset(
+    ds,
     text_field: str,
-    id_field: str,
-    rank: int,
-    world_size: int,
+    id_field: Optional[str],
 ) -> Iterable[Record]:
-    """
-    Streaming reader that shards by line index:
-      line_idx % world_size == rank
-    This avoids loading the whole dataset and keeps ordering deterministic per-shard.
-    """
-    is_jsonl = path.endswith(".jsonl") or path.endswith(".jsonl.gz")  # gzip not handled here
-    if path.endswith(".gz"):
-        raise ValueError("This script does not handle .gz directly. Decompress first or extend reader.")
-
-    with open(path, "r", encoding="utf-8") as f:
-        for idx, line in enumerate(f):
-            if (idx % world_size) != rank:
-                continue
-            line = line.strip()
-            if not line:
-                continue
-
-            if is_jsonl:
-                obj = json.loads(line)
-                text = obj.get(text_field, "")
-                if text is None:
-                    text = ""
-                rid = obj.get(id_field, idx)
-                yield Record(idx=idx, rid=rid, text=str(text), raw=obj)
-            else:
-                yield Record(idx=idx, rid=idx, text=line, raw=None)
+    for idx, ex in enumerate(ds):
+        if text_field not in ex:
+            raise KeyError(f"Missing text field '{text_field}' in example keys={list(ex.keys())}")
+        text = ex[text_field]
+        if text is None:
+            text = ""
+        rid = ex.get(id_field, idx) if id_field else idx
+        yield Record(idx=idx, rid=rid, text=str(text), raw=dict(ex))
 
 
 def batch_records(
@@ -151,7 +154,6 @@ def batch_records(
     batch: List[Record] = []
     chars = 0
     for r in records:
-        # crude length heuristic to keep latency sane
         rlen = len(r.text)
         if batch and (len(batch) >= batch_size or (chars + rlen) > max_chars_per_batch):
             yield batch
@@ -164,18 +166,12 @@ def batch_records(
 
 
 def move_extractor_to_device(extractor: Any, device: torch.device) -> None:
-    """
-    Best-effort device placement across potential GLiNER2 internal structures.
-    """
-    # If the wrapper itself supports `.to(device)`
     if hasattr(extractor, "to"):
         try:
             extractor.to(device)
             return
         except Exception:
             pass
-
-    # Try common internal attributes
     for attr in ("model", "_model", "encoder", "net"):
         m = getattr(extractor, attr, None)
         if m is not None and hasattr(m, "to"):
@@ -186,25 +182,18 @@ def move_extractor_to_device(extractor: Any, device: torch.device) -> None:
 
 
 def maybe_compile_extractor(extractor: Any) -> None:
-    """
-    Best-effort torch.compile. If GLiNER2 exposes an underlying torch.nn.Module, try compiling it.
-    """
     if not hasattr(torch, "compile"):
         return
     for attr in ("model", "_model", "encoder", "net"):
         m = getattr(extractor, attr, None)
         if isinstance(m, torch.nn.Module):
             try:
-                compiled = torch.compile(m)  # type: ignore[attr-defined]
-                setattr(extractor, attr, compiled)
+                setattr(extractor, attr, torch.compile(m))
             except Exception:
                 pass
 
 
 def build_extract_kwargs(extractor: Any, threshold: float, include_confidence: bool) -> Dict[str, Any]:
-    """
-    Only pass kwargs supported by the installed gliner2 version.
-    """
     import inspect
 
     kwargs: Dict[str, Any] = {}
@@ -216,7 +205,6 @@ def build_extract_kwargs(extractor: Any, threshold: float, include_confidence: b
         if "include_confidence" in params:
             kwargs["include_confidence"] = include_confidence
     except Exception:
-        # If introspection fails, be conservative: don't pass anything extra
         pass
     return kwargs
 
@@ -227,43 +215,27 @@ def extract_entities_batch(
     labels: LabelsType,
     kwargs: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """
-    Try batch-mode first; fallback to per-text if the installed API doesn't support list inputs.
-    Returns a list aligned with `texts`.
-    """
-    # Attempt vectorized call (if supported by library)
     try:
         out = extractor.extract_entities(texts, labels, **kwargs)
-        # Possible shapes:
-        # - list[dict] (ideal)
-        # - dict (if library ignored list and treated as one input)
         if isinstance(out, list):
             return out
         if isinstance(out, dict):
-            # treat as single result
             return [out for _ in texts]
-    except TypeError:
-        pass
     except Exception:
-        # If batch call fails for any reason, fallback
         pass
 
-    # Fallback: per-text calls
     results: List[Dict[str, Any]] = []
     for t in texts:
         results.append(extractor.extract_entities(t, labels, **kwargs))
     return results
 
 
-def prefetch_batches(
-    batch_iter: Iterable[List[Record]],
-    q: "queue.Queue[Optional[List[Record]]]",
-) -> None:
+def prefetch_batches(batch_iter, q: "queue.Queue[Optional[List[Record]]]") -> None:
     try:
         for b in batch_iter:
             q.put(b)
     finally:
-        q.put(None)  # sentinel
+        q.put(None)
 
 
 def main() -> None:
@@ -277,34 +249,30 @@ def main() -> None:
     os.makedirs(args.output, exist_ok=True)
     out_path = os.path.join(args.output, f"part-{rank:05d}.jsonl")
 
-    # Perf knobs (safe to set even if CPU)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
     labels = load_labels(args)
 
-    # Load model (one per process)
+    # Load + shard dataset per-rank
+    ds = load_hf_dataset(args)
+    ds = shard_dataset(ds, rank=rank, world_size=world_size, streaming=args.streaming)
+
+    rec_iter = iter_records_from_dataset(ds, args.text_field, args.id_field)
+    batches = batch_records(rec_iter, args.batch_size, args.max_chars_per_batch)
+
+    # Model per process / GPU
     extractor = GLiNER2.from_pretrained(args.model)
-
-    # Try to move to GPU if available (best-effort).
     move_extractor_to_device(extractor, device)
-
-    # Optional compile
     if args.compile:
         maybe_compile_extractor(extractor)
 
     extract_kwargs = build_extract_kwargs(extractor, args.threshold, args.include_confidence)
 
-    # autocast setup
     use_amp = device.type == "cuda" and (args.fp16 or args.bf16)
     amp_dtype = torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else None)
 
-    # Stream + shard input
-    rec_iter = iter_records(args.input, args.text_field, args.id_field, rank, world_size)
-    batches = batch_records(rec_iter, args.batch_size, args.max_chars_per_batch)
-
-    # Background prefetcher (keeps GPU busier)
     q: "queue.Queue[Optional[List[Record]]]" = queue.Queue(maxsize=max(1, args.prefetch_batches))
     t = threading.Thread(target=prefetch_batches, args=(batches, q), daemon=True)
     t.start()
@@ -328,9 +296,7 @@ def main() -> None:
             else:
                 results = extract_entities_batch(extractor, texts, labels, extract_kwargs)
 
-            # Write JSONL
             for rid, text, res in zip(ids, texts, results):
-                # Normalize output a bit: keep the usual {'entities': {...}} under `res`
                 line = {
                     "id": rid,
                     "text": text,
